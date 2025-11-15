@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database for Gherkin Tracker
+  database:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gherkin-tracker-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gherkin_tracker
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      # Performance tuning
+      POSTGRES_SHARED_BUFFERS: 256MB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 1GB
+      POSTGRES_WORK_MEM: 16MB
+      POSTGRES_MAINTENANCE_WORK_MEM: 128MB
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      # Persist database data
+      - gherkin_db_data:/var/lib/postgresql/data
+      # Mount additional scripts directory for ad-hoc queries
+      - ./database:/database:ro
+    networks:
+      - gherkin-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d gherkin_tracker"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Optional: PgAdmin for database management
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: gherkin-tracker-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@gherkin-tracker.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    volumes:
+      - gherkin_pgadmin_data:/var/lib/pgadmin
+    networks:
+      - gherkin-network
+    depends_on:
+      database:
+        condition: service_healthy
+    profiles:
+      - dev
+      - full
+
+# Named volumes for data persistence
+volumes:
+  gherkin_db_data:
+    driver: local
+    name: gherkin_tracker_db_data
+  gherkin_pgadmin_data:
+    driver: local
+    name: gherkin_tracker_pgadmin_data
+
+# Isolated network
+networks:
+  gherkin-network:
+    driver: bridge
+    name: gherkin_tracker_network

@@ -1,0 +1,50 @@
+version: '3.9'
+
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    user: root
+    container_name: caresync-mssql
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=CareSync_2024_Strong!
+      - MSSQL_PID=Developer
+      - MSSQL_AGENT_ENABLED=true
+      - MSSQL_ENABLE_HADR=1
+    ports:
+      - "1434:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql/data:z
+      - mssql-log:/var/opt/mssql/log:z
+      - mssql-backup:/var/opt/mssql/backup:z
+      - ./scripts:/scripts:ro
+      - ./tests:/tests:ro
+    healthcheck:
+      test: ["CMD", "/opt/mssql-tools/bin/sqlcmd", "-S", "localhost", "-U", "sa", "-P", "CareSync_2024_Strong!", "-Q", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - caresync-net
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+volumes:
+  mssql-data:
+    driver: local
+  mssql-log:
+    driver: local
+  mssql-backup:
+    driver: local
+
+networks:
+  caresync-net:
+    driver: bridge
+    name: caresync-network
