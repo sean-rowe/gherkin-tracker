@@ -982,6 +982,36 @@ C# SPECIFIC REQUIREMENTS:
    - Every public member must have /// XML docs
    - Include <summary>, <param>, <returns>, <exception> tags as appropriate
 
+✅ NEVER use 'object' type in C#
+   - Always use specific types
+   - Use generics when type varies: T instead of object
+   - Example: List<T> instead of List<object>
+
+✅ NO unused variables or parameters
+   - Remove any variable declared but never used
+   - Remove any method parameter that isn't referenced in the method body
+   - Use _ discard if you must ignore a parameter: void Method(string needed, _ unused)
+
+✅ Invert if statements to reduce nesting
+   - Example WRONG: if (x != null) { DoSomething(); }
+   - Example RIGHT: if (x is null) return; DoSomething();
+   - Use early returns to avoid deep nesting
+
+✅ Use pattern matching instead of && operators
+   - Example WRONG: if (obj != null && obj.Type == "Admin")
+   - Example RIGHT: if (obj is { Type: "Admin" })
+   - Use property patterns and type patterns
+
+✅ ALWAYS use await for async operations
+   - Never use .Result or .Wait() on Task
+   - Always use async/await pattern
+   - Example: var result = await service.GetDataAsync();
+
+✅ Make methods static when possible
+   - If a method doesn't use instance members, make it static
+   - Example: private static bool IsValid(string input) instead of private bool IsValid(string input)
+   - Static methods are faster and clearer about dependencies
+
 JAVA SPECIFIC REQUIREMENTS (if applicable):
 ✅ Use JavaDoc comments instead of XML docs
 ✅ Prefer immutable classes with builder pattern
@@ -1000,6 +1030,17 @@ PYTHON SPECIFIC REQUIREMENTS (if applicable):
 
 The following will cause IMMEDIATE FAILURE and require a complete rewrite:
 
+⚠️  CRITICAL: Any comment suggesting the code is incomplete, temporary, or simulated is STRICTLY FORBIDDEN.
+    Examples of FORBIDDEN comments:
+    - "In production, this would..."
+    - "For now, simulate..."
+    - "This would normally..."
+    - "Eventually this will..."
+    - "Placeholder for..."
+
+    These comments indicate you are NOT implementing the feature - you are faking it.
+    IMPLEMENT THE ACTUAL FUNCTIONALITY. NO SIMULATIONS. NO PLACEHOLDERS.
+
 ❌ FORBIDDEN CODE PATTERNS:
    - throw new NotImplementedException()
    - // TODO: implement this
@@ -1008,6 +1049,11 @@ The following will cause IMMEDIATE FAILURE and require a complete rewrite:
    - // Not implemented yet
    - // To be completed
    - // This should...
+   - // In production, this would...
+   - // For now, simulate...
+   - // In a real implementation...
+   - // This is a placeholder...
+   - // Temporary implementation...
    - return null!; (with no logic above it)
    - Creating interfaces with 8+ methods when you only need 1
    - Creating 4+ DTOs when you only use 1
@@ -1018,6 +1064,12 @@ The following will cause IMMEDIATE FAILURE and require a complete rewrite:
    - Classes when records or primary constructors would be better for immutable objects
    - Missing using statements
    - Compilation errors of ANY kind
+   - Using 'object' type (use specific types or generics)
+   - Unused variables or parameters in any method
+   - Nested if statements (use early returns and guard clauses)
+   - Using && with null checks (use pattern matching)
+   - Using .Result or .Wait() on async Task (use await)
+   - Non-static methods that don't use instance members
 
 ❌ FORBIDDEN ARCHITECTURAL PATTERNS:
    - Creating "comprehensive" service interfaces
