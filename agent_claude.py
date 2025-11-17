@@ -72,7 +72,7 @@ DB_PARAMS = {
 class ClaudeCodeAgent:
     """Agent that uses Claude Code CLI to implement BDD steps"""
 
-    def __init__(self, agent_id: uuid.UUID, agent_type: str, name: str, conn, config_manager: ProjectConfigManager):
+    def __init__(self, agent_id: uuid.UUID, agent_type: str, name: str, conn, config_manager: ProjectConfigManager, project_filter: Optional[str] = None):
         self.agent_id = agent_id
         self.agent_type = agent_type
         self.name = name
@@ -80,11 +80,12 @@ class ClaudeCodeAgent:
         self.config_manager = config_manager
         self.current_task = None
         self.current_project_config = None
+        self.project_filter = project_filter
 
     def get_next_task(self) -> Optional[Dict]:
         """Get the next task to work on"""
         cursor = self.conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT * FROM sp_get_next_task(%s)", (self.agent_type,))
+        cursor.execute("SELECT * FROM sp_get_next_task(%s, %s)", (self.agent_type, self.project_filter))
         task = cursor.fetchone()
         cursor.close()
 
@@ -186,9 +187,9 @@ class ClaudeCodeAgent:
             'violations': violations
         }
 
-    def run_claude(self, prompt: str, timeout: int = 300, log_prompt: bool = True) -> Dict:
+    def run_claude(self, prompt: str, timeout: int = 600, log_prompt: bool = True) -> Dict:
         """
-        Run Claude Code CLI with a prompt
+        Run Claude Code CLI with a prompt (default timeout: 600s = 10 minutes)
         Returns: {
             'success': bool,
             'output': str,
@@ -993,13 +994,13 @@ C# SPECIFIC REQUIREMENTS:
    - Use _ discard if you must ignore a parameter: void Method(string needed, _ unused)
 
 ✅ Invert if statements to reduce nesting
-   - Example WRONG: if (x != null) { DoSomething(); }
+   - Example WRONG: if (x != null) {{ DoSomething(); }}
    - Example RIGHT: if (x is null) return; DoSomething();
    - Use early returns to avoid deep nesting
 
 ✅ Use pattern matching instead of && operators
    - Example WRONG: if (obj != null && obj.Type == "Admin")
-   - Example RIGHT: if (obj is { Type: "Admin" })
+   - Example RIGHT: if (obj is {{ Type: "Admin" }})
    - Use property patterns and type patterns
 
 ✅ ALWAYS use await for async operations
@@ -1283,6 +1284,184 @@ DO NOT return explanations of what you "could" implement or what "should" be imp
                 'output': error_msg
             }
 
+    def create_feature_branch(self, task: Dict) -> Dict:
+        """
+        Create a new git branch for implementing the task.
+        Starts from the main branch to ensure clean state.
+        Returns dict with 'success', 'branch_name', and optionally 'error'.
+        """
+        try:
+            config = self.current_project_config
+            project_path = config.path
+
+            # SAFEGUARD: Check current branch to detect batch commit scenarios
+            current_branch_result = subprocess.run(
+                ['git', 'branch', '--show-current'],
+                cwd=project_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            current_branch = current_branch_result.stdout.strip()
+
+            if current_branch.startswith('feat/bdd-') or current_branch.startswith('feature/BDD-'):
+                logging.error(f"❌ SAFEGUARD TRIGGERED: Still on feature branch '{current_branch}'")
+                logging.error(f"❌ Previous task may have failed to create PR")
+                logging.error(f"❌ Refusing to reuse feature branch to prevent batch commits")
+                raise RuntimeError(
+                    f"Agent is still on feature branch '{current_branch}'. "
+                    f"Each task must create its own branch and PR. "
+                    f"Previous task likely failed PR creation. "
+                    f"Manually checkout main and fix the issue."
+                )
+
+            # Stash any uncommitted changes first
+            subprocess.run(['git', 'stash', 'push', '-m', 'Auto-stash before agent task'], cwd=project_path)
+
+            # First, ensure we're starting from a clean state on main
+            subprocess.run(['git', 'checkout', 'main'], cwd=project_path, check=True)
+            subprocess.run(['git', 'pull'], cwd=project_path, check=True)
+
+            # Generate branch name from task
+            feature_slug = re.sub(r'[^a-z0-9]+', '-', task['feature_name'].lower()).strip('-')[:30]
+            step_slug = re.sub(r'[^a-z0-9]+', '-', task['step_text'][:40].lower()).strip('-')
+            branch_name = f"feat/bdd-{feature_slug}-{step_slug}"
+
+            # Check if branch already exists
+            result = subprocess.run(
+                ['git', 'rev-parse', '--verify', branch_name],
+                cwd=project_path,
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0:
+                # Branch exists, create unique name
+                import random
+                branch_name = f"{branch_name}-{random.randint(1000, 9999)}"
+
+            # Create and checkout new branch
+            subprocess.run(
+                ['git', 'checkout', '-b', branch_name],
+                cwd=project_path,
+                check=True
+            )
+
+            # Store branch name in task for later use
+            self.current_branch = branch_name
+
+            return {
+                'success': True,
+                'branch_name': branch_name
+            }
+
+        except subprocess.CalledProcessError as e:
+            return {
+                'success': False,
+                'error': f"Git command failed: {e.stderr if hasattr(e, 'stderr') else str(e)}"
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': f"Unexpected error: {str(e)}"
+            }
+
+    def commit_and_create_pr(self, task: Dict) -> Dict:
+        """
+        Commit changes and create a PR for the completed task.
+        Returns dict with 'success', 'pr_url', and optionally 'error'.
+        """
+        try:
+            config = self.current_project_config
+            project_path = config.path
+
+            # Add all changes
+            subprocess.run(
+                ['git', 'add', '-A'],
+                cwd=project_path,
+                check=True
+            )
+
+            # Create commit message
+            commit_msg = f"""feat(bdd): {task['step_type']} {task['step_text']}
+
+Feature: {task['feature_name']}
+Scenario: {task['scenario_name']}
+
+Implemented by autonomous BDD agent.
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+"""
+
+            # Commit changes
+            subprocess.run(
+                ['git', 'commit', '-m', commit_msg],
+                cwd=project_path,
+                check=True
+            )
+
+            # Push to remote
+            branch_name = self.current_branch
+            subprocess.run(
+                ['git', 'push', '-u', 'origin', branch_name],
+                cwd=project_path,
+                check=True
+            )
+
+            # Create PR using gh CLI
+            pr_title = f"feat(bdd): {task['step_type']} {task['step_text'][:60]}"
+            pr_body = f"""## BDD Step Implementation
+
+**Feature:** {task['feature_name']}
+**Scenario:** {task['scenario_name']}
+**Step:** {task['step_type']} {task['step_text']}
+
+### Implementation Details
+
+This PR implements the BDD step definition and any necessary business logic to make the step pass.
+
+### Test Status
+
+✅ Build passes
+✅ No regressions detected
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+"""
+
+            pr_result = subprocess.run(
+                ['gh', 'pr', 'create',
+                 '--title', pr_title,
+                 '--body', pr_body,
+                 '--label', 'agent-generated',
+                 '--label', 'bdd'],
+                cwd=project_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            pr_url = pr_result.stdout.strip()
+
+            return {
+                'success': True,
+                'pr_url': pr_url
+            }
+
+        except subprocess.CalledProcessError as e:
+            return {
+                'success': False,
+                'error': f"Git command failed: {e.stderr if hasattr(e, 'stderr') else str(e)}"
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': f"Unexpected error: {str(e)}"
+            }
+
     def work_on_task(self, task: Dict, incremental_build: bool = True) -> bool:
         """Complete workflow for implementing a task with build verification and retry logic"""
         work_log = []
@@ -1294,6 +1473,23 @@ DO NOT return explanations of what you "could" implement or what "should" be imp
         logging.info(f"Feature: {task.get('feature_name')} | Scenario: {task.get('scenario_name')}")
         logging.info(f"Project: {task.get('project_name')}")
         logging.info("=" * 80)
+
+        # STEP 0: Create git branch before implementation
+        print(f"\n{'='*80}")
+        print(f"STEP 0: GIT BRANCH CREATION")
+        print(f"{'='*80}")
+        branch_result = self.create_feature_branch(task)
+        if not branch_result['success']:
+            logging.error(f"Failed to create branch: {branch_result.get('error')}")
+            work_log.append(f"Branch creation failed: {branch_result.get('error')}")
+            return self.complete_task(
+                task['task_id'],
+                '\n'.join(work_log),
+                False, False, None, None
+            )
+
+        work_log.append(f"Created branch: {branch_result['branch_name']}")
+        logging.info(f"✓ Created branch: {branch_result['branch_name']}")
 
         # OPTIMIZED: Single combined implementation instead of two separate calls
         print(f"\n{'='*80}")
@@ -1439,6 +1635,38 @@ Review the existing codebase to understand the correct property/method names, th
             task_success = False
             logging.error("✗ Task failed: Build did not pass")
 
+        # Step 4: Commit and create PR if successful
+        # SAFEGUARD: ALWAYS create individual PRs, NEVER allow batch commits
+        if task_success and build_passed:
+            print(f"\n{'='*80}")
+            print(f"STEP 3: GIT WORKFLOW (Commit + PR)")
+            print(f"{'='*80}")
+            logging.info("STEP 3: Committing changes and creating PR")
+
+            git_result = self.commit_and_create_pr(task)
+            if git_result['success']:
+                logging.info(f"✓ Successfully created PR: {git_result.get('pr_url')}")
+                work_log.append(f"\nGit Workflow:")
+                work_log.append(f"  PR: {git_result.get('pr_url')}")
+            else:
+                # CRITICAL: If PR creation fails, this is a HARD ERROR
+                # We do NOT want to continue with more tasks on the same branch
+                logging.error(f"❌ CRITICAL: PR creation failed - {git_result.get('error')}")
+                logging.error("❌ Stopping agent to prevent batch commits on single branch")
+                work_log.append(f"\nGit Workflow: FAILED - {git_result.get('error')}")
+                work_log.append(f"⚠️  Agent stopped to prevent batch commits")
+                raise RuntimeError(f"PR creation failed: {git_result.get('error')}. "
+                                 f"Each task MUST create an individual PR. "
+                                 f"Check gh CLI auth: gh auth status")
+        else:
+            # Task failed - checkout main to ensure next task starts clean
+            logging.warning("Task failed - ensuring clean state for next task")
+            try:
+                config = self.current_project_config
+                subprocess.run(['git', 'checkout', 'main'], cwd=config.path, check=False)
+            except Exception as e:
+                logging.error(f"Failed to checkout main: {e}")
+
         return self.complete_task(
             task['task_id'],
             '\n'.join(work_log),
@@ -1577,13 +1805,63 @@ Review the existing codebase to understand the correct property/method names, th
         return extensions.get(language, 'txt')
 
 
+# Module-level worker function for multiprocessing (must be picklable)
+def _parallel_worker(agent_id: str, agent_type: str, agent_num: int, completed_count, failed_count, max_tasks, project_filter: Optional[str], incremental_build: bool):
+    """Worker process that runs one agent - must be at module level for pickling"""
+    # Each process needs its own database connection
+    worker_conn = psycopg2.connect(**DB_PARAMS)
+    worker_conn.autocommit = False
+
+    # Create config manager for this worker
+    config_manager = ProjectConfigManager()
+
+    agent = ClaudeCodeAgent(
+        agent_id,
+        agent_type,
+        f"Claude-Agent-{agent_num}",
+        worker_conn,
+        config_manager,
+        project_filter=project_filter
+    )
+
+    while True:
+        # Check if we've hit max tasks
+        current_total = completed_count.value + failed_count.value
+        if max_tasks and current_total >= max_tasks:
+            break
+
+        task = agent.get_next_task()
+        if not task:
+            break
+
+        if agent.assign_task(task['task_id']):
+            success = agent.work_on_task(task, incremental_build=incremental_build)
+            if success:
+                cursor = worker_conn.cursor(cursor_factory=RealDictCursor)
+                cursor.execute("SELECT status FROM task WHERE id = %s", (task['task_id'],))
+                status = cursor.fetchone()['status']
+                cursor.close()
+
+                if status == 'Completed':
+                    completed_count.value += 1
+                else:
+                    failed_count.value += 1
+            else:
+                failed_count.value += 1
+
+            print(f"\n[Agent-{agent_num}] Progress: {completed_count.value} completed | {failed_count.value} failed\n")
+
+    worker_conn.close()
+
+
 class ClaudeOrchestrator:
     """Orchestrator for Claude Code agents"""
 
-    def __init__(self, config_manager: ProjectConfigManager = None):
+    def __init__(self, config_manager: ProjectConfigManager = None, project_filter: Optional[str] = None):
         self.conn = None
         self.agents = []
         self.config_manager = config_manager or ProjectConfigManager()
+        self.project_filter = project_filter
         # Optimization flags
         self.num_parallel = 1
         self.incremental_build = True
@@ -1624,7 +1902,7 @@ class ClaudeOrchestrator:
         self.conn.commit()
         cursor.close()
 
-        agent = ClaudeCodeAgent(agent_id, agent_type, agent_name, self.conn, self.config_manager)
+        agent = ClaudeCodeAgent(agent_id, agent_type, agent_name, self.conn, self.config_manager, self.project_filter)
         self.agents.append(agent)
 
         print(f"✓ Created Claude Code agent: {agent_name}\n")
@@ -1694,55 +1972,22 @@ class ClaudeOrchestrator:
         completed_count = manager.Value('i', 0)
         failed_count = manager.Value('i', 0)
 
-        def worker_process(agent_num: int, completed_count, failed_count, max_tasks):
-            """Worker process that runs one agent"""
-            # Each process needs its own database connection
-            worker_conn = psycopg2.connect(**DB_PARAMS)
-            worker_conn.autocommit = False
-
-            agent = ClaudeCodeAgent(
-                self.agents[agent_num - 1].agent_id,
-                self.agents[agent_num - 1].agent_type,
-                f"Claude-Agent-{agent_num}",
-                worker_conn,
-                self.config_manager
-            )
-
-            while True:
-                # Check if we've hit max tasks
-                if max_tasks and (completed_count.value + failed_count.value) >= max_tasks:
-                    break
-
-                task = agent.get_next_task()
-                if not task:
-                    break
-
-                if agent.assign_task(task['task_id']):
-                    success = agent.work_on_task(task, incremental_build=self.incremental_build)
-                    if success:
-                        cursor = worker_conn.cursor(cursor_factory=RealDictCursor)
-                        cursor.execute("SELECT status FROM task WHERE id = %s", (task['task_id'],))
-                        status = cursor.fetchone()['status']
-                        cursor.close()
-
-                        if status == 'Completed':
-                            with completed_count.get_lock():
-                                completed_count.value += 1
-                        else:
-                            with failed_count.get_lock():
-                                failed_count.value += 1
-                    else:
-                        with failed_count.get_lock():
-                            failed_count.value += 1
-
-                    print(f"\n[Agent-{agent_num}] Progress: {completed_count.value} completed | {failed_count.value} failed\n")
-
-            worker_conn.close()
-
-        # Start worker processes
+        # Start worker processes using module-level function
         processes = []
         for i in range(num_agents):
-            p = Process(target=worker_process, args=(i + 1, completed_count, failed_count, max_tasks))
+            p = Process(
+                target=_parallel_worker,
+                args=(
+                    self.agents[i].agent_id,
+                    self.agents[i].agent_type,
+                    i + 1,
+                    completed_count,
+                    failed_count,
+                    max_tasks,
+                    self.project_filter,
+                    self.incremental_build
+                )
+            )
             p.start()
             processes.append(p)
 
@@ -1759,22 +2004,46 @@ class ClaudeOrchestrator:
         self.print_statistics()
 
     def print_statistics(self):
-        """Print statistics"""
+        """Print statistics (filtered by project if project_filter is set)"""
         cursor = self.conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("""
-            SELECT
-                COUNT(*) FILTER (WHERE status = 'Completed') as completed,
-                COUNT(*) FILTER (WHERE status = 'Pending') as pending,
-                COUNT(*) FILTER (WHERE status = 'Failed') as failed,
-                COUNT(*) FILTER (WHERE bdd_implemented = TRUE AND business_logic_implemented = TRUE) as fully_implemented,
-                COUNT(*) as total
-            FROM task
-        """)
+
+        if self.project_filter:
+            # Filter by specific project
+            cursor.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE t.status = 'Completed') as completed,
+                    COUNT(*) FILTER (WHERE t.status = 'Pending') as pending,
+                    COUNT(*) FILTER (WHERE t.status = 'Failed') as failed,
+                    COUNT(*) FILTER (WHERE t.bdd_implemented = TRUE AND t.business_logic_implemented = TRUE) as fully_implemented,
+                    COUNT(*) as total
+                FROM task t
+                JOIN step s ON t.step_id = s.id
+                JOIN scenario_step ss ON ss.step_id = s.id
+                JOIN scenario sc ON ss.scenario_id = sc.id
+                JOIN feature f ON sc.feature_id = f.id
+                JOIN project p ON f.project_id = p.id
+                WHERE p.name = %s
+            """, (self.project_filter,))
+        else:
+            # Global statistics across all projects
+            cursor.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'Completed') as completed,
+                    COUNT(*) FILTER (WHERE status = 'Pending') as pending,
+                    COUNT(*) FILTER (WHERE status = 'Failed') as failed,
+                    COUNT(*) FILTER (WHERE bdd_implemented = TRUE AND business_logic_implemented = TRUE) as fully_implemented,
+                    COUNT(*) as total
+                FROM task
+            """)
+
         stats = dict(cursor.fetchone())
         cursor.close()
 
         print(f"\n{'='*80}")
-        print("FINAL STATISTICS")
+        if self.project_filter:
+            print(f"FINAL STATISTICS - {self.project_filter}")
+        else:
+            print("FINAL STATISTICS - ALL PROJECTS")
         print(f"{'='*80}")
         print(f"Total tasks:        {stats['total']:,}")
         print(f"Completed:          {stats['completed']:,} ({stats['completed']/stats['total']*100:.1f}%)")
@@ -1821,7 +2090,7 @@ def main():
     else:
         logging.info(f"Loaded {len(config_manager.list_projects())} project configurations")
 
-    orchestrator = ClaudeOrchestrator(config_manager)
+    orchestrator = ClaudeOrchestrator(config_manager, project_filter=args.project)
     orchestrator.connect()
 
     # Pass optimization flags to orchestrator
