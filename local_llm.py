@@ -21,29 +21,62 @@ class LocalLLM:
     No Ollama required - direct model loading.
     """
 
+    # Supported models with their configurations
+    MODELS = {
+        'deepseek-coder-6.7b': {
+            'path': str(Path.home() / 'models' / 'deepseek-coder-6.7b-instruct.Q5_K_M.gguf'),
+            'n_ctx': 8192,
+            'prompt_format': 'chatml'
+        },
+        'kimi-k2-instruct': {
+            'path': str(Path.home() / 'models' / 'kimi-k2' / 'instruct-2bit' / 'Kimi-K2-Instruct-UD-Q2_K_XL.gguf'),
+            'n_ctx': 32768,  # 128K capable, but 32K for memory safety
+            'prompt_format': 'chatml'
+        },
+        'kimi-k2-thinking': {
+            'path': str(Path.home() / 'models' / 'kimi-k2' / 'thinking-4bit' / 'moonshotai_Kimi-K2-Thinking-Q4_K_M.gguf'),
+            'n_ctx': 32768,  # 128K capable, but 32K for memory safety
+            'prompt_format': 'chatml'
+        }
+    }
+
     def __init__(self,
                  model_path: Optional[str] = None,
-                 n_gpu_layers: int = -1,  # -1 = offload all layers to GPU
-                 n_ctx: int = 8192,        # Context window
-                 n_threads: int = 8):      # CPU threads for non-GPU ops
+                 model_name: Optional[str] = None,
+                 n_gpu_layers: int = 0,   # 0 = CPU only (GPU not compatible with older AMD)
+                 n_ctx: Optional[int] = None,
+                 n_threads: int = 10):     # CPU threads (use all cores)
         """
         Initialize local LLM.
 
         Args:
-            model_path: Path to GGUF model file. If None, uses default from env.
-            n_gpu_layers: Number of layers to offload to GPU (-1 = all)
-            n_ctx: Context window size
+            model_path: Path to GGUF model file. If None, uses model_name or env.
+            model_name: Model preset ('deepseek-coder-6.7b', 'kimi-k2-instruct', 'kimi-k2-thinking')
+            n_gpu_layers: Number of layers to offload to GPU (-1 = all, 0 = CPU)
+            n_ctx: Context window size (overrides model default)
             n_threads: CPU threads for parts not on GPU
         """
-        self.model_path = model_path or os.getenv(
-            'LOCAL_LLM_MODEL_PATH',
-            str(Path.home() / 'models' / 'deepseek-coder-6.7b-instruct.Q5_K_M.gguf')
-        )
+        # Determine model configuration
+        if model_name and model_name in self.MODELS:
+            config = self.MODELS[model_name]
+            self.model_path = model_path or config['path']
+            self.n_ctx = n_ctx or config['n_ctx']
+            self.prompt_format = config['prompt_format']
+            self.model_name = model_name
+        else:
+            self.model_path = model_path or os.getenv(
+                'LOCAL_LLM_MODEL_PATH',
+                str(Path.home() / 'models' / 'deepseek-coder-6.7b-instruct.Q5_K_M.gguf')
+            )
+            self.n_ctx = n_ctx or 8192
+            self.prompt_format = 'chatml'
+            self.model_name = 'custom'
 
         self.n_gpu_layers = n_gpu_layers
-        self.n_ctx = n_ctx
         self.n_threads = n_threads
         self.llm = None
+
+        logging.info(f"LocalLLM configured: {self.model_name} (ctx={self.n_ctx})")
 
         # Check if llama-cpp-python is installed
         try:
@@ -79,9 +112,10 @@ class LocalLLM:
             return False
 
         try:
-            logging.info(f"Loading model: {self.model_path}")
-            logging.info(f"GPU layers: {self.n_gpu_layers} (-1 = all)")
-            logging.info(f"Context window: {self.n_ctx}")
+            logging.info(f"Loading model: {self.model_name}")
+            logging.info(f"Path: {self.model_path}")
+            logging.info(f"GPU layers: {self.n_gpu_layers} (-1 = all, 0 = CPU)")
+            logging.info(f"Context window: {self.n_ctx} tokens")
 
             self.llm = self.Llama(
                 model_path=self.model_path,
