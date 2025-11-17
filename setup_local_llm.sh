@@ -21,9 +21,21 @@ echo ""
 echo "Installing llama-cpp-python..."
 
 if [[ "$PLATFORM" == "Darwin" ]]; then
-    echo "macOS detected - installing with Metal GPU support..."
-    CMAKE_ARGS="-DLLAMA_METAL=on" pip install --upgrade llama-cpp-python
-    echo "✓ Installed with Metal GPU acceleration"
+    echo "macOS detected - checking for Metal support..."
+
+    # Check if Metal is available
+    if system_profiler SPDisplaysDataType | grep -q "Metal Support: Metal"; then
+        GPU_NAME=$(system_profiler SPDisplaysDataType | grep "Chipset Model:" | head -1 | cut -d: -f2 | xargs)
+        echo "✓ Metal GPU detected: $GPU_NAME"
+        echo "Installing llama-cpp-python with Metal support..."
+        CMAKE_ARGS="-DLLAMA_METAL=on" pip install --upgrade llama-cpp-python
+        echo "✓ Installed with Metal GPU acceleration"
+    else
+        echo "⚠️  No Metal support detected"
+        echo "Installing CPU-only version..."
+        pip install --upgrade llama-cpp-python
+        echo "⚠️  Installed CPU-only version"
+    fi
 
 elif command -v nvidia-smi &> /dev/null; then
     echo "NVIDIA GPU detected - installing with CUDA support..."

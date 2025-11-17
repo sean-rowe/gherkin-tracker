@@ -187,31 +187,64 @@ def get_recommended_model_config() -> Dict:
     """
     import platform
     import psutil
+    import subprocess
 
     system = platform.system()
     total_ram_gb = psutil.virtual_memory().total / (1024**3)
 
     # Detect GPU
-    has_metal = system == "Darwin"  # macOS has Metal
+    has_metal = False
     has_cuda = False
+    gpu_info = "Unknown"
 
+    # Check for Metal support (Apple Silicon or AMD on macOS)
+    if system == "Darwin":
+        try:
+            # Check if Metal is available
+            result = subprocess.run(
+                ['system_profiler', 'SPDisplaysDataType'],
+                capture_output=True,
+                text=True
+            )
+            if 'Metal Support: Metal' in result.stdout:
+                has_metal = True
+                # Extract GPU name
+                for line in result.stdout.split('\n'):
+                    if 'Chipset Model:' in line:
+                        gpu_info = line.split(':')[1].strip()
+                        break
+        except:
+            pass
+
+    # Check for NVIDIA CUDA
     try:
-        import subprocess
         nvidia_smi = subprocess.run(['nvidia-smi'], capture_output=True)
         has_cuda = nvidia_smi.returncode == 0
+        if has_cuda:
+            gpu_info = "NVIDIA GPU (CUDA)"
     except:
         pass
 
     # Recommend model based on RAM and GPU
-    if total_ram_gb >= 32:
-        # Can run larger models
+    # For 128GB systems, recommend the 32B model for best quality
+    if total_ram_gb >= 100:
+        recommended = {
+            'model_name': 'Qwen2.5-Coder-32B-Instruct (Q5_K_M)',
+            'model_path': str(Path.home() / 'models' / 'qwen2.5-coder-32b-instruct-q5_k_m.gguf'),
+            'download_url': 'https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct-GGUF/resolve/main/qwen2.5-coder-32b-instruct-q5_k_m.gguf',
+            'size_gb': 22.0,
+            'quality': 'Excellent (Best Available)',
+            'speed': 'Fast (with GPU)' if (has_metal or has_cuda) else 'Moderate (CPU)'
+        }
+    elif total_ram_gb >= 32:
+        # Can run 7B models
         recommended = {
             'model_name': 'Qwen2.5-Coder-7B-Instruct (Q5_K_M)',
             'model_path': str(Path.home() / 'models' / 'qwen2.5-coder-7b-instruct-q5_k_m.gguf'),
             'download_url': 'https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q5_k_m.gguf',
             'size_gb': 5.2,
             'quality': 'Excellent',
-            'speed': 'Fast (with GPU)'
+            'speed': 'Very Fast (with GPU)' if (has_metal or has_cuda) else 'Fast (CPU)'
         }
     else:
         # Smaller model for systems with less RAM
@@ -221,16 +254,18 @@ def get_recommended_model_config() -> Dict:
             'download_url': 'https://huggingface.co/TheBloke/deepseek-coder-6.7B-instruct-GGUF/resolve/main/deepseek-coder-6.7b-instruct.Q5_K_M.gguf',
             'size_gb': 4.8,
             'quality': 'Very Good',
-            'speed': 'Fast (with GPU)'
+            'speed': 'Very Fast (with GPU)' if (has_metal or has_cuda) else 'Fast (CPU)'
         }
 
     # GPU configuration
     if has_metal or has_cuda:
         recommended['n_gpu_layers'] = -1  # Offload all to GPU
-        recommended['gpu_type'] = 'Metal' if has_metal else 'CUDA'
+        recommended['gpu_type'] = f"{gpu_info} (Metal)" if has_metal else 'CUDA'
+        recommended['gpu_enabled'] = True
     else:
         recommended['n_gpu_layers'] = 0  # CPU only
         recommended['gpu_type'] = 'CPU only (slower)'
+        recommended['gpu_enabled'] = False
 
     return recommended
 
