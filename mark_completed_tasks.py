@@ -119,15 +119,20 @@ class TaskMarker:
         if self.conn:
             self.conn.close()
 
-    def get_all_steps(self) -> List[Dict]:
-        """Get all steps from database"""
+    def get_all_steps(self, project_name: str = 'CareSync') -> List[Dict]:
+        """Get all steps from database for a specific project"""
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT s.id, s.step_type, s.step_text, t.id as task_id, t.status
             FROM step s
             JOIN task t ON s.id = t.step_id
+            JOIN scenario_step ss ON s.id = ss.step_id
+            JOIN scenario sc ON ss.scenario_id = sc.id
+            JOIN feature f ON sc.feature_id = f.id
+            JOIN project p ON f.project_id = p.id
             WHERE t.status = 'Pending'
-        """)
+            AND p.name = %s
+        """, (project_name,))
 
         steps = []
         for row in cursor.fetchall():
@@ -223,8 +228,8 @@ class TaskMarker:
 
         return overlap > 0.7  # 70% word match
 
-    def mark_services_as_completed(self, service_files: List[str]):
-        """Mark tasks related to services as completed"""
+    def mark_services_as_completed(self, service_files: List[str], project_name: str = 'CareSync'):
+        """Mark tasks related to services as completed for a specific project"""
         print("\n" + "="*60)
         print("Marking Service-Related Tasks...")
         print("="*60)
@@ -239,15 +244,22 @@ class TaskMarker:
 
         for keyword in service_keywords:
             cursor.execute("""
-                UPDATE task
+                UPDATE task t
                 SET status = 'Completed',
                     code_location = 'src/Infrastructure/Services/',
                     completed_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP,
                     notes = 'Service infrastructure exists - marked as completed'
-                WHERE status = 'Pending'
-                AND LOWER(task_name) LIKE %s
-            """, (f'%{keyword}%',))
+                FROM step s
+                JOIN scenario_step ss ON s.id = ss.step_id
+                JOIN scenario sc ON ss.scenario_id = sc.id
+                JOIN feature f ON sc.feature_id = f.id
+                JOIN project p ON f.project_id = p.id
+                WHERE t.step_id = s.id
+                AND t.status = 'Pending'
+                AND LOWER(t.task_name) LIKE %s
+                AND p.name = %s
+            """, (f'%{keyword}%', project_name))
 
             updated = cursor.rowcount
             if updated > 0:
@@ -258,20 +270,23 @@ class TaskMarker:
 
 def main():
     """Main entry point"""
-    if len(sys.argv) < 2:
-        print("Usage: python mark_completed_tasks.py <caresync_directory>")
-        print("Example: python mark_completed_tasks.py /Users/srowe/RiderProjects/caresync")
+    if len(sys.argv) < 3:
+        print("Usage: python mark_completed_tasks.py <project_name> <codebase_directory>")
+        print("Example: python mark_completed_tasks.py CareSync /Users/srowe/RiderProjects/caresync")
+        print("Example: python mark_completed_tasks.py CueMap /Users/srowe/RiderProjects/cuemap")
         sys.exit(1)
 
-    codebase_path = sys.argv[1]
+    project_name = sys.argv[1]
+    codebase_path = sys.argv[2]
 
     if not Path(codebase_path).exists():
         print(f"✗ Directory not found: {codebase_path}")
         sys.exit(1)
 
     print("\n" + "="*60)
-    print("CareSync Task Completion Scanner")
+    print(f"{project_name} Task Completion Scanner")
     print("="*60)
+    print(f"Project: {project_name}")
     print(f"Codebase: {codebase_path}")
     print("="*60)
 
@@ -285,9 +300,9 @@ def main():
     marker = TaskMarker()
     marker.connect()
 
-    # Get pending steps
-    db_steps = marker.get_all_steps()
-    print(f"\n✓ Found {len(db_steps)} pending tasks in database")
+    # Get pending steps for this project
+    db_steps = marker.get_all_steps(project_name)
+    print(f"\n✓ Found {len(db_steps)} pending tasks in database for {project_name}")
 
     # Match and mark
     if step_definitions:
@@ -295,21 +310,37 @@ def main():
 
     # Mark service-related tasks
     if service_files:
-        marker.mark_services_as_completed(service_files)
+        marker.mark_services_as_completed(service_files, project_name)
 
-    # Get final statistics
+    # Get final statistics for this project only
     cursor = marker.conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM task WHERE status = 'Completed'")
+    cursor.execute("""
+        SELECT COUNT(*) FROM task t
+        JOIN step s ON t.step_id = s.id
+        JOIN scenario_step ss ON s.id = ss.step_id
+        JOIN scenario sc ON ss.scenario_id = sc.id
+        JOIN feature f ON sc.feature_id = f.id
+        JOIN project p ON f.project_id = p.id
+        WHERE t.status = 'Completed' AND p.name = %s
+    """, (project_name,))
     completed_count = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM task WHERE status = 'Pending'")
+    cursor.execute("""
+        SELECT COUNT(*) FROM task t
+        JOIN step s ON t.step_id = s.id
+        JOIN scenario_step ss ON s.id = ss.step_id
+        JOIN scenario sc ON ss.scenario_id = sc.id
+        JOIN feature f ON sc.feature_id = f.id
+        JOIN project p ON f.project_id = p.id
+        WHERE t.status = 'Pending' AND p.name = %s
+    """, (project_name,))
     pending_count = cursor.fetchone()[0]
 
     cursor.close()
     marker.close()
 
     print("\n" + "="*60)
-    print("Final Statistics")
+    print(f"Final Statistics for {project_name}")
     print("="*60)
     print(f"Completed tasks: {completed_count}")
     print(f"Pending tasks: {pending_count}")

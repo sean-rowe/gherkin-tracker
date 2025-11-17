@@ -365,38 +365,32 @@ def main():
     importer.connect()
     importer.project_id = importer.get_or_create_project(project_name)
 
-    # Import each feature file in a single transaction
+    # Import each feature file with individual commits (to handle errors gracefully)
     imported_count = 0
     failed_count = 0
 
-    try:
-        for feature_file in feature_files:
-            try:
-                parser = GherkinParser(str(feature_file))
-                feature_data = parser.parse()
+    for feature_file in feature_files:
+        try:
+            parser = GherkinParser(str(feature_file))
+            feature_data = parser.parse()
 
-                if feature_data['feature_name']:
-                    importer.import_feature(feature_data)
-                    imported_count += 1
-                else:
-                    print(f"  ⚠ Skipped (no feature name): {feature_file.name}")
-            except Exception as e:
-                print(f"  ✗ Error parsing {feature_file.name}: {e}")
-                failed_count += 1
-                # Don't re-raise - continue with other features but mark as failed
+            if feature_data['feature_name']:
+                importer.import_feature(feature_data)
+                # Commit after each successful import
+                importer.conn.commit()
+                imported_count += 1
+            else:
+                print(f"  ⚠ Skipped (no feature name): {feature_file.name}")
+        except Exception as e:
+            print(f"  ✗ Error parsing {feature_file.name}: {e}")
+            failed_count += 1
+            # Rollback the failed transaction and continue with next feature
+            importer.conn.rollback()
+            importer.step_cache.clear()
 
-        # Commit all imports in one transaction
-        importer.conn.commit()
-        print(f"\n✓ All features committed successfully in a single transaction")
+    print(f"\n✓ Import process completed")
 
-    except Exception as e:
-        # Rollback everything if something went wrong
-        importer.conn.rollback()
-        importer.step_cache.clear()
-        print(f"\n✗ Fatal error - all imports rolled back: {e}")
-
-    finally:
-        importer.close()
+    importer.close()
 
     print(f"\n{'='*60}")
     print(f"Import Complete")

@@ -204,8 +204,8 @@ class PRReviewDaemon:
             body = comment.get('body', '')
             user = comment.get('user', {}).get('login', '')
 
-            # Only process CodeRabbit comments
-            if 'coderabbit' not in user.lower():
+            # Only process CodeRabbit or Gemini Code Assist comments
+            if 'coderabbit' not in user.lower() and 'gemini' not in user.lower():
                 continue
 
             # Skip already resolved comments
@@ -242,16 +242,61 @@ class PRReviewDaemon:
             logging.info(f"Creating worktree for PR #{pr_number} fixes...")
             worktree_path = self.worktree_manager.worktree_base / f"task_{task_id}"
 
+            # Clean up existing worktree if it exists
+            if worktree_path.exists():
+                logging.info(f"Cleaning up existing worktree at {worktree_path}")
+                self.worktree_manager.cleanup_worktree(task_id, force=True)
+
+            # Fetch latest changes
+            subprocess.run(
+                ["git", "fetch", "origin"],
+                cwd=self.repo_path,
+                check=True,
+                capture_output=True
+            )
+
+            # Delete local branch if it exists and recreate from remote
+            subprocess.run(
+                ["git", "branch", "-D", branch_name],
+                cwd=self.repo_path,
+                capture_output=True  # Don't fail if branch doesn't exist
+            )
+
+            # Create worktree from remote branch
             subprocess.run(
                 [
                     "git", "worktree", "add",
                     str(worktree_path),
-                    branch_name
+                    f"origin/{branch_name}"
                 ],
                 cwd=self.repo_path,
                 check=True,
                 capture_output=True
             )
+
+            # Create local tracking branch
+            subprocess.run(
+                ["git", "checkout", "-b", branch_name, f"origin/{branch_name}"],
+                cwd=worktree_path,
+                check=True,
+                capture_output=True
+            )
+
+            # Copy vendor directory from main repo (faster than submodule init)
+            logging.info("Copying vendor dependencies from main repo...")
+            import shutil
+            main_vendor = self.repo_path / "vendor"
+            worktree_vendor = worktree_path / "vendor"
+
+            # Remove existing vendor dir (it's a git submodule ref, we need the actual files)
+            if worktree_vendor.exists():
+                shutil.rmtree(worktree_vendor)
+
+            if main_vendor.exists():
+                shutil.copytree(main_vendor, worktree_vendor, symlinks=True)
+                logging.info("✓ Vendor dependencies copied")
+            else:
+                logging.warning("Main repo vendor directory not found")
 
             # Build fix prompt from comments
             fix_prompt = self._build_fix_prompt(comments)
@@ -260,9 +305,10 @@ class PRReviewDaemon:
             logging.info("Running Claude Code to fix review comments...")
             result = subprocess.run(
                 [
-                    "claude-code",
+                    "claude",
+                    "-p",
                     "--dangerously-skip-permissions",
-                    "--prompt", fix_prompt
+                    fix_prompt
                 ],
                 cwd=worktree_path,
                 capture_output=True,
@@ -295,6 +341,12 @@ class PRReviewDaemon:
                     pr_number,
                     f"🤖 Auto-fixed {len(comments)} review comments. Build verified successful."
                 )
+
+                # After fixing, check if we should merge immediately
+                # Since we just fixed the issues and verified build, skip quiet period
+                logging.info("Checking if PR should be merged after fixes...")
+                if self._should_merge_pr(pr, skip_quiet_period=True):
+                    self._merge_pr(pr)
 
         except Exception as e:
             logging.error(f"Error during auto-fix: {e}", exc_info=True)
@@ -348,12 +400,61 @@ class PRReviewDaemon:
         """
         try:
             logging.info("Verifying build...")
+
+            # Detect project type and use appropriate build command
+            if Path(worktree_path / "CMakeLists.txt").exists():
+                # C++ project with CMake - need to configure first
+                logging.info("Configuring CMake build...")
+                build_dir = worktree_path / "build"
+                build_dir.mkdir(exist_ok=True)
+
+                # Configure CMake
+                config_result = subprocess.run(
+                    ["cmake", "-S", ".", "-B", "build", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Debug"],
+                    cwd=worktree_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+
+                if config_result.returncode != 0:
+                    logging.error(f"✗ CMake configuration failed:\n{config_result.stdout}\n{config_result.stderr}")
+                    return False
+
+                logging.info("✓ CMake configured")
+
+                # Build
+                build_cmd = ["cmake", "--build", "build", "-j4"]
+            elif list(Path(worktree_path).glob("*.csproj")):
+                # C# project
+                build_cmd = ["dotnet", "build", "--no-restore", "--warnaserror"]
+            else:
+                # Default to cmake
+                logging.info("Configuring CMake build...")
+                build_dir = worktree_path / "build"
+                build_dir.mkdir(exist_ok=True)
+
+                config_result = subprocess.run(
+                    ["cmake", "-S", ".", "-B", "build", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Debug"],
+                    cwd=worktree_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+
+                if config_result.returncode != 0:
+                    logging.error(f"✗ CMake configuration failed:\n{config_result.stdout}\n{config_result.stderr}")
+                    return False
+
+                build_cmd = ["cmake", "--build", "build", "-j4"]
+
+            logging.info(f"Running build command: {' '.join(build_cmd)}")
             result = subprocess.run(
-                ["dotnet", "build", "--no-restore", "--warnaserror"],
+                build_cmd,
                 cwd=worktree_path,
                 capture_output=True,
                 text=True,
-                timeout=120
+                timeout=300  # 5 minutes for C++ builds
             )
 
             if result.returncode == 0:
@@ -367,12 +468,13 @@ class PRReviewDaemon:
             logging.error(f"Build verification error: {e}")
             return False
 
-    def _should_merge_pr(self, pr: Dict) -> bool:
+    def _should_merge_pr(self, pr: Dict, skip_quiet_period: bool = False) -> bool:
         """
         Determine if a PR should be merged.
 
         Args:
             pr: PR dictionary
+            skip_quiet_period: If True, skip the quiet period check (used after auto-fixes)
 
         Returns:
             True if PR should be merged, False otherwise
@@ -390,6 +492,11 @@ class PRReviewDaemon:
         # If approved, merge immediately
         if review_decision == 'APPROVED':
             logging.info(f"✓ PR #{pr_number} is approved")
+            return True
+
+        # If we just fixed issues and verified build, merge immediately
+        if skip_quiet_period:
+            logging.info(f"✓ PR #{pr_number} auto-fixes verified, merging immediately")
             return True
 
         # If no review decision, check quiet period
@@ -538,6 +645,65 @@ class PRReviewDaemon:
             logging.info(f"✓ Added comment to PR #{pr_number}")
         except subprocess.CalledProcessError as e:
             logging.error(f"Failed to add comment: {e}")
+
+    def _resolve_comments(self, pr_number: int, comments: List[Dict]):
+        """
+        Resolve (mark as resolved) review comments that were fixed.
+
+        Args:
+            pr_number: PR number
+            comments: List of comment dicts to resolve
+        """
+        for comment in comments:
+            comment_id = comment.get('id')
+            if not comment_id:
+                continue
+
+            try:
+                # Use GitHub GraphQL API to resolve the comment thread
+                # First get the thread ID from the comment
+                query = f'query {{ node(id: "{comment_id}") {{ ... on PullRequestReviewComment {{ id pullRequestReview {{ id }} }} }} }}'
+                result = subprocess.run(
+                    [
+                        "gh", "api", "graphql",
+                        "-f", f"query={query}"
+                    ],
+                    cwd=self.repo_path,
+                    capture_output=True,
+                    text=True
+                )
+
+                if result.returncode == 0:
+                    # Mark as resolved by adding a reply
+                    self._reply_to_comment(pr_number, comment_id, "✅ Fixed by automated daemon")
+                    logging.info(f"✓ Resolved comment {comment_id}")
+                else:
+                    logging.warning(f"Could not resolve comment {comment_id}")
+
+            except Exception as e:
+                logging.warning(f"Failed to resolve comment {comment_id}: {e}")
+
+    def _reply_to_comment(self, pr_number: int, comment_id: int, body: str):
+        """
+        Reply to a review comment.
+
+        Args:
+            pr_number: PR number
+            comment_id: Comment ID to reply to
+            body: Reply body
+        """
+        try:
+            subprocess.run(
+                [
+                    "gh", "pr", "comment", str(pr_number),
+                    "--body", body
+                ],
+                cwd=self.repo_path,
+                capture_output=True,
+                check=True
+            )
+        except subprocess.CalledProcessError as e:
+            logging.warning(f"Failed to reply to comment: {e}")
 
 
 def main():

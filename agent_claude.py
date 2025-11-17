@@ -70,9 +70,9 @@ DB_PARAMS = {
 
 
 class ClaudeCodeAgent:
-    """Agent that uses Claude Code CLI to implement BDD steps"""
+    """Agent that uses Claude Code CLI to implement BDD steps, with local LLM fallback"""
 
-    def __init__(self, agent_id: uuid.UUID, agent_type: str, name: str, conn, config_manager: ProjectConfigManager, project_filter: Optional[str] = None):
+    def __init__(self, agent_id: uuid.UUID, agent_type: str, name: str, conn, config_manager: ProjectConfigManager, project_filter: Optional[str] = None, use_local_llm: bool = False):
         self.agent_id = agent_id
         self.agent_type = agent_type
         self.name = name
@@ -81,6 +81,14 @@ class ClaudeCodeAgent:
         self.current_task = None
         self.current_project_config = None
         self.project_filter = project_filter
+        self.use_local_llm = use_local_llm
+        self.local_llm = None
+
+        # Initialize local LLM if requested
+        if use_local_llm:
+            from local_llm import LocalLLM
+            self.local_llm = LocalLLM()
+            logging.info("Local LLM fallback enabled")
 
     def get_next_task(self) -> Optional[Dict]:
         """Get the next task to work on"""
@@ -189,18 +197,28 @@ class ClaudeCodeAgent:
 
     def run_claude(self, prompt: str, timeout: int = 600, log_prompt: bool = True) -> Dict:
         """
-        Run Claude Code CLI with a prompt (default timeout: 600s = 10 minutes)
+        Run Claude Code CLI with a prompt, with fallback to local LLM.
+
+        Tries Claude Code first. If that fails or use_local_llm is True, uses local model.
+
+        Args:
+            prompt: Prompt to send
+            timeout: Timeout in seconds (only for Claude Code)
+            log_prompt: Whether to log the prompt
+
         Returns: {
             'success': bool,
             'output': str,
-            'error': str
+            'error': str,
+            'model_used': 'claude' | 'local'
         }
         """
         if not self.current_project_config:
             return {
                 'success': False,
                 'output': '',
-                'error': 'No project configuration available'
+                'error': 'No project configuration available',
+                'model_used': 'none'
             }
 
         try:
@@ -211,56 +229,75 @@ class ClaudeCodeAgent:
                 return {
                     'success': False,
                     'output': '',
-                    'error': f'Project path does not exist: {project_path}'
+                    'error': f'Project path does not exist: {project_path}',
+                    'model_used': 'none'
                 }
 
             # Log the prompt if requested
             if log_prompt:
                 logging.debug("=" * 100)
-                logging.debug("SENDING PROMPT TO CLAUDE CODE:")
+                logging.debug("SENDING PROMPT TO LLM:")
                 logging.debug("-" * 100)
                 # Log first 500 chars of prompt
                 prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
                 logging.debug(prompt_preview)
                 logging.debug("=" * 100)
 
-            # Run claude with the prompt
-            # Use --dangerously-skip-permissions for automated agent use
-            # This bypasses ALL permission checks so Claude can write files without approval
-            logging.info(f"Executing Claude Code CLI (timeout: {timeout}s)...")
-            result = subprocess.run(
-                ['claude', '-p', '--dangerously-skip-permissions', prompt],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=str(project_path),
-                stdin=subprocess.DEVNULL  # Provide empty stdin to prevent hanging
+            # Try Claude Code first (unless use_local_llm is explicitly set)
+            if not self.use_local_llm:
+                try:
+                    # Run claude with the prompt
+                    # Use --dangerously-skip-permissions for automated agent use
+                    # This bypasses ALL permission checks so Claude can write files without approval
+                    logging.info(f"Executing Claude Code CLI (timeout: {timeout}s)...")
+                    result = subprocess.run(
+                        ['claude', '-p', '--dangerously-skip-permissions', prompt],
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        cwd=str(project_path),
+                        stdin=subprocess.DEVNULL  # Provide empty stdin to prevent hanging
+                    )
+
+                    if result.returncode == 0:
+                        logging.info("✓ Claude Code execution successful")
+                        return {
+                            'success': True,
+                            'output': result.stdout,
+                            'error': '',
+                            'model_used': 'claude'
+                        }
+                    else:
+                        logging.warning(f"Claude Code failed (exit {result.returncode}), falling back to local LLM")
+                        logging.debug(f"Claude stderr: {result.stderr[:200]}")
+
+                except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                    logging.warning(f"Claude Code unavailable: {e}, falling back to local LLM")
+
+            # Fallback to local LLM
+            logging.info("Using local LLM...")
+
+            if self.local_llm is None:
+                from local_llm import LocalLLM
+                self.local_llm = LocalLLM()
+
+            # Generate using local model
+            result = self.local_llm.generate(
+                prompt,
+                max_tokens=4096,
+                temperature=0.1  # Low temperature for code generation
             )
 
-            # Log the result
-            if result.returncode == 0:
-                logging.info(f"✓ Claude Code succeeded")
-                logging.debug(f"Output: {result.stdout[:200]}...")
-            else:
-                logging.error(f"✗ Claude Code failed with return code {result.returncode}")
-                logging.error(f"Error: {result.stderr[:200]}")
+            result['model_used'] = 'local'
+            return result
 
-            return {
-                'success': result.returncode == 0,
-                'output': result.stdout,
-                'error': result.stderr
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                'success': False,
-                'output': '',
-                'error': f'Claude command timed out after {timeout} seconds'
-            }
         except Exception as e:
+            logging.error(f"✗ LLM execution error: {e}")
             return {
                 'success': False,
                 'output': '',
-                'error': str(e)
+                'error': str(e),
+                'model_used': 'none'
             }
 
     def implement_bdd_step(self, task: Dict) -> Dict:
@@ -1902,7 +1939,8 @@ class ClaudeOrchestrator:
         self.conn.commit()
         cursor.close()
 
-        agent = ClaudeCodeAgent(agent_id, agent_type, agent_name, self.conn, self.config_manager, self.project_filter)
+        use_local_llm = os.getenv('USE_LOCAL_LLM', 'false').lower() in ['true', '1', 'yes']
+        agent = ClaudeCodeAgent(agent_id, agent_type, agent_name, self.conn, self.config_manager, self.project_filter, use_local_llm)
         self.agents.append(agent)
 
         print(f"✓ Created Claude Code agent: {agent_name}\n")
@@ -2066,6 +2104,8 @@ def main():
                        help='Number of parallel agents to run (e.g., --parallel 4)')
     parser.add_argument('--no-incremental-build', dest='incremental_build', action='store_false', default=True,
                        help='Disable incremental builds (run full dotnet restore each time)')
+    parser.add_argument('--use-local-llm', action='store_true',
+                       help='Use local LLM instead of Claude Code (requires setup via setup_local_llm.sh)')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Enable verbose logging (DEBUG level)')
     parser.add_argument('--log-file', type=str, default=None,
@@ -2089,6 +2129,11 @@ def main():
         config_manager = create_default_configs()
     else:
         logging.info(f"Loaded {len(config_manager.list_projects())} project configurations")
+
+    # Set environment variable for local LLM if requested
+    if args.use_local_llm:
+        os.environ['USE_LOCAL_LLM'] = '1'
+        logging.info("Using local LLM (fallback from Claude Code)")
 
     orchestrator = ClaudeOrchestrator(config_manager, project_filter=args.project)
     orchestrator.connect()
