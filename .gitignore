@@ -28,6 +28,8 @@ wheels/
 agent_*.log
 daemon.log
 cleanup.log
+logs/
+logs/**
 
 # Database
 *.db

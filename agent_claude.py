@@ -18,7 +18,7 @@ import time
 import re
 import logging
 from pathlib import Path
-from project_config import ProjectConfigManager, ProjectConfig
+from gherkin_tracker.domain.project_config import ProjectConfigManager, ProjectConfig
 
 # Setup logging
 def setup_logging(log_file=None, verbose=False):
@@ -86,7 +86,7 @@ class ClaudeCodeAgent:
 
         # Initialize local LLM if requested
         if use_local_llm:
-            from local_llm import LocalLLM
+            from gherkin_tracker.infrastructure.local_llm import LocalLLM
             self.local_llm = LocalLLM()
             logging.info("Local LLM fallback enabled")
 
@@ -278,7 +278,7 @@ class ClaudeCodeAgent:
             logging.info("Using local LLM...")
 
             if self.local_llm is None:
-                from local_llm import LocalLLM
+                from gherkin_tracker.infrastructure.local_llm import LocalLLM
                 self.local_llm = LocalLLM()
 
             # Generate using local model
@@ -2125,7 +2125,7 @@ def main():
     if len(config_manager.list_projects()) == 0:
         print("No project configurations found. Creating default configuration...")
         logging.warning("No project configurations found - creating defaults")
-        from project_config import create_default_configs
+        from gherkin_tracker.domain.project_config import create_default_configs
         config_manager = create_default_configs()
     else:
         logging.info(f"Loaded {len(config_manager.list_projects())} project configurations")
