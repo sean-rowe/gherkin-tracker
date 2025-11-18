@@ -1,0 +1,22 @@
+# Requirements for Gherkin Tracker
+
+# Core dependencies
+psycopg2-binary>=2.9.0  # PostgreSQL adapter
+
+# Local LLM support (DeepSeek)
+# Install with GPU acceleration based on platform:
+#
+# macOS (Metal GPU):
+#   CMAKE_ARGS="-DLLAMA_METAL=on" pip install llama-cpp-python
+#
+# Linux with NVIDIA GPU (CUDA):
+#   CMAKE_ARGS="-DLLAMA_CUDA=on" pip install llama-cpp-python
+#
+# CPU only (slower):
+#   pip install llama-cpp-python
+
+llama-cpp-python>=0.2.0
+
+# System utilities
+psutil>=5.9.0
+
